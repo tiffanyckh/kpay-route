@@ -138,3 +138,13 @@ label.check input{width:auto;margin:0}
 .toast{position:fixed;left:50%;bottom:84px;transform:translateX(-50%);background:#1c2321;color:#fff;padding:10px 16px;border-radius:20px;font-size:14px;z-index:1100;max-width:90vw;text-align:center}
 
 @media(max-width:420px){.kpis{grid-template-columns:repeat(2,1fr)}}
+
+.risk{font-size:12px;margin-top:4px;padding:4px 8px;border-radius:6px;display:inline-block}
+.risk.low{background:#e8f6ee;color:#166534}
+.risk.mid{background:#fff4e0;color:#9a5b00}
+.risk.high{background:#fdeaea;color:#b91c1c}
+.risk-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:3px;vertical-align:0}
+.risk-dot.mid{background:#d97706}.risk-dot.high{background:#dc2626}
+.hol{font-size:12px;font-weight:600;color:#9a5b00;background:#fff4e0;border-radius:6px;padding:1px 6px;margin-left:4px}
+.pin.riskmid{box-shadow:0 0 0 3px #f59e0b,0 1px 4px rgba(0,0,0,.35)}
+.pin.riskhigh{box-shadow:0 0 0 3px #dc2626,0 1px 4px rgba(0,0,0,.35)}

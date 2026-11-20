@@ -344,7 +344,7 @@ function parseManualHours(s){
   return out.length ? out : null;
 }
 // 回傳當日營業時段 [[開,收],...]（分鐘）；null = 唔知（當全日開）；[] = 當日唔開
-function windowsFor(m, date){
+function knownWindows(m, date){
   if (m.manualHours){ const w = parseManualHours(m.manualHours); if (w) return w; }
   const h = m.hours;
   if (!h || !h.periods || !h.periods.length) return null;
@@ -361,6 +361,85 @@ function windowsFor(m, date){
   }
   return out.sort((a,b) => a[0]-b[0]);
 }
+// ---- 公眾假期（1823 政府資料）----
+const HOLIDAYS = {
+  '2026-01-01':'一月一日','2026-02-17':'農曆年初一','2026-02-18':'農曆年初二','2026-02-19':'農曆年初三',
+  '2026-04-03':'耶穌受難節','2026-04-04':'耶穌受難節翌日','2026-04-06':'清明節翌日','2026-04-07':'復活節星期一翌日',
+  '2026-05-01':'勞動節','2026-05-25':'佛誕翌日','2026-06-19':'端午節','2026-07-01':'回歸紀念日',
+  '2026-09-26':'中秋節翌日','2026-10-01':'國慶日','2026-10-19':'重陽節翌日','2026-12-25':'聖誕節','2026-12-26':'聖誕節後第一個周日',
+  '2027-01-01':'一月一日','2027-02-06':'農曆年初一','2027-02-08':'農曆年初三','2027-02-09':'農曆年初四',
+  '2027-03-26':'耶穌受難節','2027-03-27':'耶穌受難節翌日','2027-03-29':'復活節星期一','2027-04-05':'清明節',
+  '2027-05-01':'勞動節','2027-05-13':'佛誕','2027-06-09':'端午節','2027-07-01':'回歸紀念日',
+  '2027-09-16':'中秋節翌日','2027-10-01':'國慶日','2027-10-08':'重陽節','2027-12-25':'聖誕節','2027-12-27':'聖誕節後第一個周日',
+};
+const holidayOf = date => HOLIDAYS[date] || null;
+const isRestDay = date => wdOf(date) === 0 || !!holidayOf(date);
+
+// ---- 冇營業時間時，按行業同地址估 ----
+const UPPER_FLOOR = /(\d+\s*(樓|字樓|\/F|F\b)|室|單位)/i;
+const GROUND = /(地下|地舖|地鋪|地庫|G\/F)/i;
+const INDUSTRIAL = /(工業|工廠|工貿|廠廈|貨倉|倉庫|INDUSTRIAL|FACTORY)/i;
+function guessProfile(m){
+  const cat = `${m.industry || ''} ${m.business || ''} ${m.product || ''}`;
+  const addr = m.address || '';
+  if (INDUSTRIAL.test(addr) && UPPER_FLOOR.test(addr) && !GROUND.test(addr))
+    return { label:'工廈辦公時間', wk:[[600,1080]], sat:[[600,780]], rest:[] };
+  if (/醫療|中醫|診所|牙科|物理治療/.test(cat))
+    return { label:'診所時間', wk:[[570,780],[900,1140]], sat:[[570,780]], rest:[] };
+  if (/教育|補習|學校|學院|教育中心|興趣班/.test(cat))
+    return { label:'補習社時間', wk:[[840,1200]], sat:[[600,1080]], rest:[[600,1080]] };
+  if (/餐飲|餐廳|小食|茶餐廳|快餐|酒樓|甜品|飲品|咖啡/.test(cat))
+    return { label:'食肆時間', wk:[[660,1290]], sat:[[660,1290]], rest:[[660,1290]] };
+  if (UPPER_FLOOR.test(addr) && !GROUND.test(addr))
+    return { label:'樓上鋪時間', wk:[[720,1200]], sat:[[720,1200]], rest:[[720,1200]] };
+  return { label:'一般鋪頭時間', wk:[[660,1200]], sat:[[660,1200]], rest:[[660,1200]] };
+}
+function guessWindows(m, date){
+  const g = guessProfile(m);
+  if (isRestDay(date)) return g.rest;
+  return wdOf(date) === 6 ? g.sat : g.wk;
+}
+function hoursSrc(m){
+  if (m.manualHours && parseManualHours(m.manualHours)) return 'manual';
+  if (m.hours && m.hours.periods && m.hours.periods.length) return 'google';
+  return 'guess';
+}
+// 規劃用：有真營業時間用真嘅，冇就用估計
+function windowsFor(m, date){
+  const k = knownWindows(m, date);
+  return k ? k : guessWindows(m, date);
+}
+const fmtWins = w => w.length ? w.map(x => `${fmtMin(x[0])}–${fmtMin(x[1])}`).join(', ') : '休息';
+
+// 幾時去會唔會冇開：回 {level:'low'|'mid'|'high', reasons:[]}
+function notOpenTries(m){ return (m.history || []).filter(x => x.status === 'retry'); }
+function riskFor(m, date, startMin){
+  const r = [], src = hoursSrc(m);
+  let level = 'low';
+  const up = l => { if (l === 'high' || (l === 'mid' && level === 'low')) level = l; };
+  if (m.gStatus === 'CLOSED_PERMANENTLY'){ up('high'); r.push('Google 顯示已結業'); }
+  if (m.gStatus === 'CLOSED_TEMPORARILY'){ up('high'); r.push('Google 顯示暫停營業'); }
+  const tries = notOpenTries(m);
+  if (tries.length >= 2){ up('high'); r.push(`之前已經 ${tries.length} 次冇開`); }
+  else if (tries.length === 1){
+    const t = new Date(tries[0].at), tm = t.getHours()*60 + t.getMinutes();
+    const same = t.getDay() === wdOf(date) && startMin != null && Math.abs(tm - startMin) <= 90;
+    up('mid'); r.push(same ? `上次${WEEK[t.getDay()] === '日' ? '星期日' : '星期' + WEEK[t.getDay()]}差唔多時間去過冇開` : `上次（${tries[0].date}）去過冇開`);
+  }
+  if (src === 'guess'){ up('mid'); r.push(`冇營業時間資料，按${guessProfile(m).label}估`); }
+  const hol = holidayOf(date);
+  if (hol && src === 'google'){ up('mid'); r.push(`${hol}係公眾假期，可能唔跟平日時間`); }
+  if (startMin != null){
+    const w = windowsFor(m, date).find(x => startMin >= x[0] - 1 && startMin <= x[1]);
+    if (w && src !== 'guess'){
+      if (startMin - w[0] < 20){ up('mid'); r.push('啱啱開門，可能未準時開'); }
+      else if (w[1] - startMin < 30){ up('mid'); r.push('就嚟收工'); }
+    }
+  }
+  return { level, reasons: r };
+}
+const RISK_LABEL = { low:'應該有開', mid:'可能冇開', high:'好大機會冇開' };
+
 function hoursText(m, date){
   if (m.manualHours) return m.manualHours;
   const h = m.hours;
@@ -369,9 +448,13 @@ function hoursText(m, date){
     const t = h.text[(wdOf(date) + 6) % 7];
     return t.replace(/^[^:：]+[:：]\s*/, '');
   }
-  const w = windowsFor(m, date);
+  const w = knownWindows(m, date);
   if (!w) return '';
-  return w.length ? w.map(x => `${fmtMin(x[0])}–${fmtMin(x[1])}`).join(', ') : '休息';
+  return fmtWins(w);
+}
+function hoursLabel(m, date){
+  const t = hoursText(m, date);
+  return t || `估計 ${fmtWins(guessWindows(m, date))}`;
 }
 
 /* ---------- travel model ---------- */
@@ -399,7 +482,7 @@ function slotFor(m, date, arrive, dwell, dayEnd){
   return { start, close };
 }
 function simulate(route, day, opts){
-  let pos = day.from, t = day.fromMin;
+  let pos = day.from, t = day.fromMin, pen = 0;
   const stops = [];
   for (const mid of route){
     const m = M(mid);
@@ -407,9 +490,13 @@ function simulate(route, day, opts){
     const s = slotFor(m, day.date, t + tr, opts.dwell, day.endMin);
     if (!s) return { ok:false };
     stops.push({ mid, travel: tr, arrive: t + tr, start: s.start, leave: s.start + opts.dwell });
+    for (const x of notOpenTries(m)){
+      const d = new Date(x.at), tm = d.getHours()*60 + d.getMinutes();
+      if (d.getDay() === wdOf(day.date) && Math.abs(tm - s.start) <= 90) pen += 40;
+    }
     t = s.start + opts.dwell; pos = m;
   }
-  return { ok:true, stops, end: t };
+  return { ok:true, stops, end: t, cost: t + pen };
 }
 function buildDay(cands, day, opts, cap){
   const used = new Set(), route = [];
@@ -423,6 +510,13 @@ function buildDay(cands, day, opts, cap){
       const s = slotFor(m, day.date, t + tr, opts.dwell, day.endMin);
       if (!s) continue;
       let score = s.start - t;
+      const tries = notOpenTries(m);
+      if (tries.length >= 2) score += 30;   // 多次冇開：排後啲
+      for (const x of tries){                 // 避開上次冇開嘅同一個星期幾、差唔多時間
+        const d = new Date(x.at), tm = d.getHours()*60 + d.getMinutes();
+        if (d.getDay() === wdOf(day.date) && Math.abs(tm - s.start) <= 90) score += 40;
+      }
+      if (hoursSrc(m) === 'guess') score += 5;
       const slack = s.close - (s.start + opts.dwell);
       if (slack < 60) score -= 15;          // 就快收嘅鋪優先
       if (slack < 30) score -= 15;
@@ -444,7 +538,7 @@ function improve(route, day, opts){
       for (let j = i + 1; j < best.length; j++){
         const cand = best.slice(0, i).concat(best.slice(i, j+1).reverse(), best.slice(j+1));
         const sim = simulate(cand, day, opts);
-        if (sim.ok && sim.end < bestSim.end - 0.5){ best = cand; bestSim = sim; improved = true; }
+        if (sim.ok && sim.cost < bestSim.cost - 0.5){ best = cand; bestSim = sim; improved = true; }
       }
     }
     // 搬單一站去另一位置 (or-opt)
@@ -453,7 +547,7 @@ function improve(route, day, opts){
         if (i === j) continue;
         const cand = best.slice(); const [x] = cand.splice(i, 1); cand.splice(j, 0, x);
         const sim = simulate(cand, day, opts);
-        if (sim.ok && sim.end < bestSim.end - 0.5){ best = cand; bestSim = sim; improved = true; }
+        if (sim.ok && sim.cost < bestSim.cost - 0.5){ best = cand; bestSim = sim; improved = true; }
       }
     }
   }
@@ -462,7 +556,8 @@ function improve(route, day, opts){
 
 const isOpenTask = m => m && (m.status === 'pending' || m.status === 'retry');
 const resOf = (d, mid) => (d.res || (d.res = {}))[mid];
-function plannable(){ return allM().filter(m => (m.status === 'pending' || m.status === 'retry') && hasGeo(m)); }
+const gClosed = m => m.gStatus === 'CLOSED_PERMANENTLY' || m.gStatus === 'CLOSED_TEMPORARILY';
+function plannable(){ return allM().filter(m => (m.status === 'pending' || m.status === 'retry') && hasGeo(m) && !gClosed(m)); }
 
 // 重新排：保留已 tick 嘅，未做嘅重新分配去今日（未收工）同之後嘅日子
 function replan(){
@@ -563,7 +658,7 @@ function renderSetup(){
   $('#dayRows').innerHTML = D.rows.map((r, i) => {
     const date = addDays(D.startDate, i);
     return `<div class="day-row" data-i="${i}">
-      <div class="t">第 ${i+1} 日 · ${dateLabel(date)}</div>
+      <div class="t">第 ${i+1} 日 · ${dateLabel(date)}${holidayOf(date) ? ` <span class="hol">${esc(holidayOf(date))}</span>` : (wdOf(date) === 0 ? ' <span class="hol">星期日</span>' : '')}</div>
       <div class="grid3">
         <label>開始<input type="time" data-f="start" value="${esc(r.start)}"></label>
         <label>收工<input type="time" data-f="end" value="${esc(r.end)}"></label>
@@ -657,13 +752,12 @@ function scheduleFor(d){
 function stopCard(m, idx, d, info){
   const res = resOf(d, m.mid);
   const st = res ? res.status : 'pending';
-  const h = hoursText(m, d.date);
+  const h = hoursLabel(m, d.date);
   const mode = S.plan.settings.mode;
   const prev = (m.history || []).filter(x => !res || x.at !== res.at).slice(-1)[0];
   const lastTxt = prev ? `上次（${prev.date}）：${STATUS_TEXT[prev.status]}${prev.reasonText ? '·' + prev.reasonText : ''}` : '';
   const warn = [];
-  if (m.gStatus === 'CLOSED_PERMANENTLY') warn.push('Google 顯示已結業');
-  if (m.gStatus === 'CLOSED_TEMPORARILY') warn.push('Google 顯示暫停營業');
+  const risk = st === 'pending' ? riskFor(m, d.date, info ? info.start : null) : null;
   if (info && info.wait > 1) warn.push(`要等 ${Math.round(info.wait)} 分鐘先開門`);
   if (m.geo === 'als' && apiKey()) warn.push('Google 搵唔到，位置按地址估');
   const at = res ? new Date(res.at) : null;
@@ -674,8 +768,9 @@ function stopCard(m, idx, d, info){
       <div class="name">${esc(m.name)}</div>
       <div class="meta">MID <b>${esc(m.mid)}</b>${m.business ? ` · ${esc(m.business)}` : ''}</div>
       <div class="meta">${esc(m.address)}</div>
-      <div class="meta">營業：<b>${esc(h || '未知')}</b> · 電話：${m.phone ? `<a href="tel:${esc(m.phone.replace(/\s/g,''))}"><b>${esc(m.phone)}</b></a>` : '<b>未知</b>'}</div>
+      <div class="meta">營業：<b>${esc(h)}</b> · 電話：${m.phone ? `<a href="tel:${esc(m.phone.replace(/\s/g,''))}"><b>${esc(m.phone)}</b></a>` : '<b>未知</b>'}</div>
       ${lastTxt ? `<div class="meta">${esc(lastTxt)}</div>` : ''}
+      ${risk ? `<div class="risk ${risk.level}"><b>${RISK_LABEL[risk.level]}</b>${risk.reasons.length ? '：' + esc(risk.reasons.join('；')) : ''}</div>` : ''}
       ${warn.length ? `<div class="warn">⚠︎ ${esc(warn.join('；'))}</div>` : ''}
       ${st === 'pending' ? `<div class="actions">
           <button class="btn ok sm" data-act="ok" data-mid="${esc(m.mid)}" data-day="${d.date}">✓ 成功</button>
@@ -711,8 +806,13 @@ function renderRoute(){
     gmLink = `https://www.google.com/maps/dir/?api=1&origin=${origin.lat},${origin.lng}&destination=${dest.lat},${dest.lng}${wps ? '&waypoints=' + encodeURIComponent(wps) : ''}&travelmode=${MODE_GMAPS[mode]}`;
   }
   const isActive = !d.closed && d.date >= today;
+  const rc = { mid:0, high:0 };
+  sch.todo.forEach(mid => { const e = sch.eta[mid]; const r = riskFor(M(mid), d.date, e ? e.start : null); if (r.level !== 'low') rc[r.level]++; });
+  const hol = holidayOf(d.date);
   $('#routeHead').innerHTML = `
     <div class="big">${dateLabel(d.date)}　${fmtMin(d.startMin)}–${fmtMin(d.endMin)}</div>
+    ${hol || wdOf(d.date) === 0 ? `<div class="risk mid small"><b>${hol ? esc(hol) + '（公眾假期）' : '星期日'}</b>：工廈、診所、寫字樓嘅鋪多數唔開</div>` : ''}
+    ${rc.mid || rc.high ? `<div class="small" style="margin:4px 0"><span class="risk-dot high"></span>好大機會冇開 ${rc.high}　<span class="risk-dot mid"></span>可能冇開 ${rc.mid}　<span class="muted">（建議出發前打電話問）</span></div>` : ''}
     <div class="muted small">由 ${esc(d.startText || '')} 出發 · 已做 ${sch.done.length} · 未做 ${sch.todo.length}${sch.todo.length ? ` · 預計 ${fmtMin(sch.end)} 做完` : ''}${d.closed ? ' · 已收工' : ''}</div>
     <div class="row gap wrap" style="margin-top:8px">
       ${gmLink ? `<a class="btn sm primary" target="_blank" rel="noopener" href="${gmLink}">下 ${nextStops.length} 站開 Google Maps</a>` : ''}
@@ -722,6 +822,8 @@ function renderRoute(){
   let html = '';
   const unplaced = (P.unplaced || []).map(M).filter(Boolean);
   const nogeo = allM().filter(m => (m.status === 'pending' || m.status === 'retry') && !hasGeo(m));
+  const closedG = allM().filter(m => (m.status === 'pending' || m.status === 'retry') && gClosed(m));
+  if (closedG.length) html += `<div class="unplaced">有 <b>${closedG.length}</b> 間 Google 顯示已結業／暫停營業，冇排入路線：${closedG.slice(0,5).map(m => esc(m.name)).join('、')}${closedG.length > 5 ? '…' : ''}。去「總覽」可以直接標「不成功」，或者撳「改」再查。</div>`;
   if (unplaced.length) html += `<div class="unplaced">有 <b>${unplaced.length}</b> 間排唔落任何一日（時間唔夠或者嗰幾日唔開）。可以加日子、延長時間或者喺總覽睇。</div>`;
   if (nogeo.length) html += `<div class="unplaced">有 <b>${nogeo.length}</b> 間地圖搵唔到位置，未排入路線。去「總覽」揀「地圖搵唔到」改地址。</div>`;
   let idx = 0;
@@ -930,9 +1032,12 @@ function pinIcon(cls, label='', small=false){
     iconSize: small ? [14,14] : [26,26], iconAnchor: small ? [7,7] : [13,13], popupAnchor: [0, -10] });
 }
 function popupHtml(m, date){
-  const h = hoursText(m, date || todayStr());
+  const dd = date || todayStr();
+  const h = hoursLabel(m, dd);
+  const rk = (m.status === 'pending' || m.status === 'retry') ? riskFor(m, dd, null) : null;
   return `<div class="pop"><h4>${esc(m.name)}</h4>
-    <div class="small">MID ${esc(m.mid)}<br>${esc(m.address)}<br>營業：${esc(h || '未知')}<br>電話：${m.phone ? `<a href="tel:${esc(m.phone.replace(/\s/g,''))}">${esc(m.phone)}</a>` : '未知'}<br>狀態：${STATUS_TEXT[m.status]}${m.failReasonText ? '·' + esc(m.failReasonText) : ''}</div>
+    ${rk && rk.level !== 'low' ? `<div class="risk ${rk.level} small"><b>${RISK_LABEL[rk.level]}</b>：${esc(rk.reasons.join('；'))}</div>` : ''}
+    <div class="small">MID ${esc(m.mid)}<br>${esc(m.address)}<br>營業：${esc(h)}<br>電話：${m.phone ? `<a href="tel:${esc(m.phone.replace(/\s/g,''))}">${esc(m.phone)}</a>` : '未知'}<br>狀態：${STATUS_TEXT[m.status]}${m.failReasonText ? '·' + esc(m.failReasonText) : ''}</div>
     ${m.status === 'pending' || m.status === 'retry' ? `<div class="row gap" style="margin-top:6px">
       <button class="btn ok sm" data-act="ok" data-mid="${esc(m.mid)}" data-day="${date || ''}">✓ 成功</button><button class="btn no sm" data-act="no" data-mid="${esc(m.mid)}" data-day="${date || ''}">✗ 不成功</button>
       <a class="btn sm" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${m.lat},${m.lng}&travelmode=${MODE_GMAPS[(S.plan && S.plan.settings.mode) || 'walk']}">導航</a></div>` : ''}</div>`;
@@ -976,7 +1081,8 @@ function renderMap(fit=false){
     let i = 0;
     sch.todo.map(M).filter(hasGeo).forEach(m => {
       i++;
-      L.marker([m.lat, m.lng], { icon: pinIcon('route', i), zIndexOffset: 1000 }).bindPopup(() => popupHtml(m, day.date)).addTo(layerRoute);
+      const e = sch.eta[m.mid], rk = riskFor(m, day.date, e ? e.start : null).level;
+      L.marker([m.lat, m.lng], { icon: pinIcon('route' + (rk !== 'low' ? ' risk' + rk : ''), i), zIndexOffset: 1000 }).bindPopup(() => popupHtml(m, day.date)).addTo(layerRoute);
       line.push([m.lat, m.lng]); pts.push([m.lat, m.lng]);
     });
     if (line.length > 1) L.polyline(line, { color: '#0f766e', weight: 3, opacity: .8, dashArray: '6 6' }).addTo(layerRoute);
@@ -1013,5 +1119,5 @@ renderAll();
 if (S.plan && S.plan.days.some(d => !d.closed && d.date >= todayStr())) show('route');
 
 // 方便測試／除錯
-window.__app = { S: () => S, replan, windowsFor, travelMin };
+window.__app = { S: () => S, replan, windowsFor, travelMin, riskFor, guessProfile };
 })();
