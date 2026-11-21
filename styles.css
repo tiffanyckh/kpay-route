@@ -153,3 +153,8 @@ label.check input{width:auto;margin:0}
 .notes-t{font-weight:700;font-size:13px;margin-bottom:2px}
 .notes ul{margin:0;padding-left:18px;font-size:13px;line-height:1.5}
 .notes li{margin:2px 0}
+
+.numcol{flex:none;display:flex;flex-direction:column;align-items:center;gap:4px}
+.mv{width:30px;height:26px;border:1px solid var(--line);background:#fff;border-radius:6px;font-size:11px;color:var(--brand);cursor:pointer;padding:0}
+.mv:disabled{opacity:.3}
+.mv:active{background:var(--brand-2)}

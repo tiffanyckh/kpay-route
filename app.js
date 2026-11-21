@@ -449,14 +449,28 @@ function replan(){
   const P = S.plan; if (!P) return { placed:0, unplaced:0 };
   const opts = P.settings, today = todayStr(), now = nowMin();
   const doneSet = new Set();
+  // 手動調整過次序嘅日子：保留原本次序（除咗已做／下次再去嘅）
+  const lockedOf = new Map();
+  for (const d of P.days){
+    if (!d.locked) continue;
+    const skip = new Set(d.skip || []);
+    lockedOf.set(d, d.stops.filter(mid => !resOf(d, mid) && isOpenTask(M(mid)) && hasGeo(M(mid)) && !skip.has(mid)));
+  }
   for (const d of P.days){
     d.stops = d.stops.filter(mid => M(mid) && resOf(d, mid));
     d.stops.forEach(x => doneSet.add(x));
   }
   const usable = P.days.filter(d => !d.closed && (d.date > today || (d.date === today && now < d.endMin - opts.dwell)));
   let cands = plannable();
+  const lockedMids = new Set(); usable.forEach(d => (lockedOf.get(d) || []).forEach(x => lockedMids.add(x)));
+  cands = cands.filter(m => !lockedMids.has(m.mid));
   const plans = [];
-  usable.forEach((d, i) => {
+  const free = usable.filter(d => !lockedOf.has(d));
+  usable.forEach(d => {
+    if (!lockedOf.has(d)) return;
+    plans.push({ d, day: { date: d.date, from: d.planFrom || d.start, fromMin: d.planFromMin ?? d.startMin, endMin: d.endMin, skip: new Set(d.skip || []) }, route: lockedOf.get(d), locked: true });
+  });
+  free.forEach((d, i) => {
     let from = d.start, fromMin = d.startMin;
     if (d.date === today){
       fromMin = Math.max(d.startMin, now);
@@ -464,7 +478,7 @@ function replan(){
       if (last) from = { lat: last.lat, lng: last.lng };
     }
     const day = { date: d.date, from, fromMin, endMin: d.endMin, skip: new Set(d.skip || []) };
-    const left = usable.length - i;
+    const left = free.length - i;
     const cap = opts.balance ? Math.ceil(cands.length / left) : Infinity;
     let route = buildDay(cands, day, opts, cap);
     route = improve(route, day, opts);
@@ -478,6 +492,7 @@ function replan(){
     for (const m of cands){
       let best = null;
       for (const pl of plans){
+        if (pl.locked) continue;
         if (m.status === 'retry' && m.lastTryDate === pl.day.date) continue;
         if (pl.day.skip.has(m.mid)) continue;
         const base = simulate(pl.route, pl.day, opts); if (!base.ok) continue;
@@ -648,7 +663,8 @@ function stopCard(m, idx, d, info){
   if (info && info.wait > 1) warn.push(`要等 ${Math.round(info.wait)} 分鐘先開門`);
   const at = res ? new Date(res.at) : null;
   return `<div class="stop ${st}" data-mid="${esc(m.mid)}">
-    <div class="num">${st === 'pending' ? idx : (st === 'success' ? '✓' : '✗')}</div>
+    <div class="numcol"><div class="num">${st === 'pending' ? idx : (st === 'success' ? '✓' : '✗')}</div>
+      ${st === 'pending' && info && !d.closed ? `<button class="mv" data-act="up" data-mid="${esc(m.mid)}" data-day="${d.date}" ${info.first ? 'disabled' : ''} aria-label="上移">▲</button><button class="mv" data-act="down" data-mid="${esc(m.mid)}" data-day="${d.date}" ${info.last ? 'disabled' : ''} aria-label="下移">▼</button>` : ''}</div>
     <div class="body">
       ${info ? `<div class="eta">約 ${fmtMin(info.start)} 到 · 行 ${Math.round(info.travel)} 分鐘</div>` : ''}
       <div class="name">${esc(m.name)}</div>
@@ -715,9 +731,10 @@ function renderRoute(){
     <div class="big">${dateLabel(d.date)}　${fmtMin(d.startMin)}–${fmtMin(d.endMin)}</div>
     ${notes.length ? `<div class="notes"><div class="notes-t">今日注意</div><ul>${notes.map(n => `<li>${n}</li>`).join('')}</ul></div>` : ''}
     <div class="muted small">由 ${esc(d.startText || '')} 出發 · 已做 ${sch.done.length} · 未做 ${sch.todo.length}${sch.todo.length ? ` · 預計 ${fmtMin(sch.end)} 做完` : ''}${d.closed ? ' · 已收工' : ''}</div>
+    ${d.locked ? `<div class="small" style="margin-top:4px;color:var(--brand);font-weight:600">✋ 次序已經手動調整過；撳「下次再去」或者收工都會保留你嘅次序</div>` : ''}
     <div class="row gap wrap" style="margin-top:8px">
       ${gmLink ? `<a class="btn sm primary" target="_blank" rel="noopener" href="${gmLink}">下 ${nextStops.length} 站開 Google Maps</a>` : ''}
-      ${isActive ? `<button class="btn sm" data-act="replan">重新排程</button>` : ''}
+      ${isActive ? `<button class="btn sm" data-act="replan">${d.locked ? '恢復 AI 排法' : '重新排程'}</button>` : ''}
       ${isActive && sch.todo.length ? `<button class="btn sm" data-act="closeday">今日收工：未做嘅排去之後</button>` : ''}
     </div>`;
   let html = '';
@@ -727,7 +744,8 @@ function renderRoute(){
   if (nogeo.length) html += `<div class="unplaced">有 <b>${nogeo.length}</b> 間地圖搵唔到位置，未排入路線。去「總覽」揀「地圖搵唔到」改地址。</div>`;
   let idx = 0;
   html += sch.done.map(mid => stopCard(M(mid), 0, d, null)).join('');
-  html += sch.todo.map(mid => { const m = M(mid); idx++; return stopCard(m, idx, d, sch.eta[mid]); }).join('');
+  const nT = sch.todo.length;
+  html += sch.todo.map((mid, k) => { const m = M(mid); idx++; const e = sch.eta[mid] ? { ...sch.eta[mid], first: k === 0, last: k === nT - 1 } : null; return stopCard(m, idx, d, e); }).join('');
   if (!d.stops.length) html += `<div class="empty">呢日冇排到鋪。</div>`;
   $('#routeList').innerHTML = html;
 }
@@ -825,7 +843,18 @@ document.addEventListener('click', async e => {
     renderAll();
     toast(nd ? `已改去 ${dateLabel(nd.date)}，今日路線已重新排` : '之後冇日子排得落，去「設定」加日子');
   }
-  else if (act === 'replan'){ const r = replan(); renderAll(); toast(`已重新排，${r.placed} 間` + (r.unplaced ? `，${r.unplaced} 間排唔落` : '')); }
+  else if (act === 'up' || act === 'down'){
+    const d = S.plan.days.find(x => x.date === hint); if (!d) return;
+    const done = d.stops.filter(x => resOf(d, x));
+    const todo = d.stops.filter(x => !resOf(d, x) && isOpenTask(M(x)));
+    const i = todo.indexOf(mid), j = act === 'up' ? i - 1 : i + 1;
+    if (i < 0 || j < 0 || j >= todo.length) return;
+    [todo[i], todo[j]] = [todo[j], todo[i]];
+    d.stops = done.concat(todo); d.locked = true;
+    save(); renderRoute(); if (mapObj && curView === 'map') renderMap();
+    const el = document.querySelector(`.stop[data-mid="${CSS.escape(mid)}"]`); if (el) el.scrollIntoView({ block: 'center' });
+  }
+  else if (act === 'replan'){ const dd = S.plan.days.find(x => x.date === routeDay); if (dd) dd.locked = false; const r = replan(); renderAll(); toast(`已重新排，${r.placed} 間` + (r.unplaced ? `，${r.unplaced} 間排唔落` : '')); }
   else if (act === 'closeday'){
     const d = S.plan.days.find(x => x.date === routeDay);
     if (!await confirmBox('今日收工？', '未做嘅鋪會自動排去之後嘅日子。', '收工', false)) return;
