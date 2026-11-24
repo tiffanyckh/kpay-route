@@ -64,7 +64,7 @@ label.check input{width:auto;margin:0}
 .dot.pending{background:var(--pending)}.dot.success{background:var(--success)}.dot.retry{background:var(--retry)}.dot.fail{background:var(--fail)}
 .pin{width:26px;height:26px;border-radius:50%;border:2px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.35);
   color:#fff;font-size:12px;font-weight:700;display:flex;align-items:center;justify-content:center}
-.pin.small{width:14px;height:14px}
+.pin.small{width:18px;height:18px}
 .pin.start{background:#111;border-radius:6px}
 .pin.pending{background:var(--pending)} .pin.success{background:var(--success)} .pin.retry{background:var(--retry)} .pin.fail{background:var(--fail)}
 .pin.route{background:var(--brand)}

@@ -383,6 +383,27 @@ function simulate(route, day, opts){
   }
   return { ok:true, stops, end: t, cost: t + pen };
 }
+// 附近嘅鋪（同一幢／隔籬）當一組，一次過去哂
+const GROUP_M = 80;
+function clusterOf(list){
+  const cid = new Map(); let n = 0;
+  const pts = list.filter(hasGeo);
+  for (const a of pts){
+    if (cid.has(a.mid)) continue;
+    const id = ++n; cid.set(a.mid, id);
+    for (const b of pts) if (!cid.has(b.mid) && distM(a, b) <= GROUP_M) cid.set(b.mid, id);
+  }
+  return cid;
+}
+function contiguous(route, cl){
+  if (!cl) return true;
+  const seen = new Set(); let prev = null;
+  for (const mid of route){
+    const c = cl.get(mid);
+    if (c !== prev){ if (seen.has(c)) return false; seen.add(c); prev = c; }
+  }
+  return true;
+}
 function buildDay(cands, day, opts, cap){
   const used = new Set(), route = [];
   let pos = day.from, t = day.fromMin;
@@ -411,8 +432,38 @@ function buildDay(cands, day, opts, cap){
     if (!best) break;
     used.add(best.m.mid); route.push(best.m.mid);
     t = best.s.start + opts.dwell; pos = best.m;
+    // 同組（附近）嘅鋪即刻跟住去，就算超過每日平均數
+    const c = day.cl && day.cl.get(best.m.mid);
+    if (c){
+      for (;;){
+        let nb = null, nd = Infinity;
+        for (const m of cands){
+          if (used.has(m.mid) || day.cl.get(m.mid) !== c) continue;
+          if ((m.status === 'retry' && m.lastTryDate === day.date) || (day.skip && day.skip.has(m.mid))) continue;
+          const dd = distM(pos, m); if (dd < nd){ nd = dd; nb = m; }
+        }
+        if (!nb) break;
+        const s2 = slotFor(nb, day.date, t + travelMin(pos, nb, opts.mode), opts.dwell, day.endMin);
+        used.add(nb.mid);
+        if (!s2) continue;
+        route.push(nb.mid); t = s2.start + opts.dwell; pos = nb;
+      }
+    }
   }
   return route;
+}
+// 將一間鋪插入最慳時間嘅位置；冇位就放最尾
+function insertBest(route, mid, day, opts){
+  let best = null;
+  for (let k = 0; k <= route.length; k++){
+    const r = route.slice(); r.splice(k, 0, mid);
+    const sim = simulate(r, day, opts);
+    if (sim.ok && (!best || sim.cost < best.cost)) best = { r, cost: sim.cost };
+  }
+  if (best) return best.r;
+  let near = -1, nd = Infinity;                      // 時間唔夠：放喺最近嗰間後面
+  route.forEach((x, k) => { const dd = distM(M(x), M(mid)); if (dd < nd){ nd = dd; near = k; } });
+  const r = route.slice(); r.splice(near + 1, 0, mid); return r;
 }
 function improve(route, day, opts){
   let best = route.slice(), bestSim = simulate(best, day, opts);
@@ -424,7 +475,7 @@ function improve(route, day, opts){
       for (let j = i + 1; j < best.length; j++){
         const cand = best.slice(0, i).concat(best.slice(i, j+1).reverse(), best.slice(j+1));
         const sim = simulate(cand, day, opts);
-        if (sim.ok && sim.cost < bestSim.cost - 0.5){ best = cand; bestSim = sim; improved = true; }
+        if (sim.ok && sim.cost < bestSim.cost - 0.5 && contiguous(cand, day.cl)){ best = cand; bestSim = sim; improved = true; }
       }
     }
     // 搬單一站去另一位置 (or-opt)
@@ -433,7 +484,7 @@ function improve(route, day, opts){
         if (i === j) continue;
         const cand = best.slice(); const [x] = cand.splice(i, 1); cand.splice(j, 0, x);
         const sim = simulate(cand, day, opts);
-        if (sim.ok && sim.cost < bestSim.cost - 0.5){ best = cand; bestSim = sim; improved = true; }
+        if (sim.ok && sim.cost < bestSim.cost - 0.5 && contiguous(cand, day.cl)){ best = cand; bestSim = sim; improved = true; }
       }
     }
   }
@@ -462,6 +513,16 @@ function replan(){
   }
   const usable = P.days.filter(d => !d.closed && (d.date > today || (d.date === today && now < d.endMin - opts.dwell)));
   let cands = plannable();
+  const cl = clusterOf(cands);
+  // 手動加入咗某日嘅鋪（地圖灰點撳「加入路線」）
+  const pinOf = new Map(), pinned = new Set();
+  for (const d of usable){
+    if (lockedOf.has(d)) continue;
+    const skip = new Set(d.skip || []);
+    const list = (d.pin || []).filter(mid => isOpenTask(M(mid)) && hasGeo(M(mid)) && !skip.has(mid) && !pinned.has(mid));
+    d.pin = list; list.forEach(x => pinned.add(x)); pinOf.set(d, list);
+  }
+  cands = cands.filter(m => !pinned.has(m.mid));
   const lockedMids = new Set(); usable.forEach(d => (lockedOf.get(d) || []).forEach(x => lockedMids.add(x)));
   cands = cands.filter(m => !lockedMids.has(m.mid));
   const plans = [];
@@ -477,10 +538,12 @@ function replan(){
       const last = d.stops.map(M).filter(m => m && m.visitedAt && hasGeo(m)).sort((a,b) => a.visitedAt - b.visitedAt).pop();
       if (last) from = { lat: last.lat, lng: last.lng };
     }
-    const day = { date: d.date, from, fromMin, endMin: d.endMin, skip: new Set(d.skip || []) };
+    const day = { date: d.date, from, fromMin, endMin: d.endMin, skip: new Set(d.skip || []), cl };
     const left = free.length - i;
-    const cap = opts.balance ? Math.ceil(cands.length / left) : Infinity;
+    const pins = pinOf.get(d) || [];
+    const cap = opts.balance ? Math.max(0, Math.ceil((cands.length + pins.length) / left) - pins.length) : Infinity;
     let route = buildDay(cands, day, opts, cap);
+    for (const mid of pins) route = insertBest(route, mid, day, opts);
     route = improve(route, day, opts);
     plans.push({ d, day, route });
     const used = new Set(route);
@@ -789,6 +852,29 @@ function undoResult(mid, dayDate){
   else { m.failReason = last.reason; m.failReasonText = last.reasonText; m.lastTryDate = last.date; }
   save(); renderAll();
 }
+function addToDay(mid, date){
+  const P = S.plan; if (!P) return;
+  const d = P.days.find(x => x.date === date); if (!d) return;
+  for (const x of P.days){
+    if (x === d) continue;
+    if (!resOf(x, mid)) x.stops = x.stops.filter(y => y !== mid);
+    if (x.pin) x.pin = x.pin.filter(y => y !== mid);
+  }
+  P.unplaced = (P.unplaced || []).filter(y => y !== mid);
+  d.skip = (d.skip || []).filter(y => y !== mid);
+  if (d.locked){
+    const done = d.stops.filter(x => resOf(d, x));
+    const todo = d.stops.filter(x => !resOf(d, x) && isOpenTask(M(x)) && x !== mid);
+    const day = { date: d.date, from: d.planFrom || d.start, fromMin: d.planFromMin ?? d.startMin, endMin: d.endMin };
+    d.stops = done.concat(insertBest(todo, mid, day, P.settings));
+  } else {
+    d.pin = Array.from(new Set([...(d.pin || []), mid]));
+  }
+  replan();
+  const sch = scheduleFor(d), k = sch.todo.indexOf(mid);
+  save(); renderAll();
+  toast(k >= 0 ? `已加入 ${dateLabel(d.date)} 路線（第 ${k + 1} 站）` : '加唔到入呢日');
+}
 function failDialog(mid, hint){
   const m = M(mid);
   let sel = null;
@@ -835,8 +921,10 @@ document.addEventListener('click', async e => {
   else if (act === 'no'){ if (mapObj) mapObj.closePopup(); failDialog(mid, hint); }
   else if (act === 'undo') undoResult(mid, hint);
   else if (act === 'edit') editDialog(mid);
+  else if (act === 'add'){ if (mapObj) mapObj.closePopup(); addToDay(mid, hint); }
   else if (act === 'later'){
     const d = S.plan.days.find(x => x.date === hint); if (!d) return;
+    d.pin = (d.pin || []).filter(x => x !== mid);
     d.skip = Array.from(new Set([...(d.skip || []), mid]));
     replan();
     const nd = S.plan.days.find(x => x.date !== hint && x.stops.includes(mid) && !resOf(x, mid));
@@ -961,16 +1049,33 @@ $('#sumFilter').addEventListener('change', renderSummary);
 let mapObj = null, layerAll = null, layerRoute = null;
 function pinIcon(cls, label='', small=false){
   return L.divIcon({ className: '', html: `<div class="pin ${cls} ${small ? 'small' : ''}">${label}</div>`,
-    iconSize: small ? [14,14] : [26,26], iconAnchor: small ? [7,7] : [13,13], popupAnchor: [0, -10] });
+    iconSize: small ? [18,18] : [26,26], iconAnchor: small ? [9,9] : [13,13], popupAnchor: [0, -10] });
 }
-function popupHtml(m, date){
+function addTargetDay(){
+  const P = S.plan; if (!P) return null;
+  const sel = $('#mapDay') && $('#mapDay').value;
+  const today = todayStr(), now = nowMin();
+  const open = d => !d.closed && (d.date > today || (d.date === today && now < d.endMin));
+  if (sel && sel !== 'all'){ const d = P.days.find(x => x.date === sel); if (d && open(d)) return d; }
+  return P.days.find(x => x.date === routeDay && open(x)) || P.days.find(open) || null;
+}
+function popupHtml(m, date, grey){
   const dd = date || todayStr();
   const h = hoursText(m, dd);
+  let addBtn = '';
+  if (grey && (m.status === 'pending' || m.status === 'retry')){
+    const t = addTargetDay();
+    if (t){
+      const inIt = t.stops.includes(m.mid) && !resOf(t, m.mid);
+      addBtn = inIt ? `<div class="small muted" style="margin-top:6px">已經喺 ${dateLabel(t.date)} 路線</div>`
+        : `<button class="btn primary sm" style="margin-top:6px;width:100%;justify-content:center" data-act="add" data-mid="${esc(m.mid)}" data-day="${t.date}">＋ 加入 ${dateLabel(t.date)} 路線</button>`;
+    }
+  }
   return `<div class="pop"><h4>${esc(m.name)}</h4>
     <div class="small">MID ${esc(m.mid)}<br>${esc(m.address)}${h ? '<br>營業：' + esc(h) : ''}${m.phone ? '<br>電話：' + `<a href="tel:${esc(m.phone.replace(/\s/g,''))}">${esc(m.phone)}</a>` : ''}<br>狀態：${STATUS_TEXT[m.status]}${m.failReasonText ? '·' + esc(m.failReasonText) : ''}</div>
     ${m.status === 'pending' || m.status === 'retry' ? `<div class="row gap" style="margin-top:6px">
       <button class="btn ok sm" data-act="ok" data-mid="${esc(m.mid)}" data-day="${date || ''}">✓ 成功</button><button class="btn no sm" data-act="no" data-mid="${esc(m.mid)}" data-day="${date || ''}">✗ 不成功</button>
-      <a class="btn sm" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${m.lat},${m.lng}&travelmode=${MODE_GMAPS[(S.plan && S.plan.settings.mode) || 'walk']}">導航</a></div>` : ''}</div>`;
+      <a class="btn sm" target="_blank" rel="noopener" href="https://www.google.com/maps/dir/?api=1&destination=${m.lat},${m.lng}&travelmode=${MODE_GMAPS[(S.plan && S.plan.settings.mode) || 'walk']}">導航</a></div>` : ''}${addBtn}</div>`;
 }
 function initMap(){
   if (mapObj) return;
@@ -995,7 +1100,7 @@ function renderMap(fit=false){
   if ($('#mapShowAll').checked || !day){
     for (const m of allM()){
       if (!hasGeo(m) || inRoute.has(m.mid)) continue;
-      L.marker([m.lat, m.lng], { icon: pinIcon(m.status, '', !!day) }).bindPopup(() => popupHtml(m)).addTo(layerAll);
+      L.marker([m.lat, m.lng], { icon: pinIcon(m.status, '', !!day) }).bindPopup(() => popupHtml(m, null, true)).addTo(layerAll);
       if (!day) pts.push([m.lat, m.lng]);
     }
   }
